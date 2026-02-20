@@ -117,12 +117,14 @@ func Run(cfg *config.Config, db *storage.Database) error {
 	os.MkdirAll(workingDir, 0o755)
 
 	// Build ToolRegistry.
+	sender := &registrySender{registry: registry, db: db}
 	toolRegistry := tools.BuildStandardRegistry(tools.RegistryConfig{
 		WorkingDir:      workingDir,
 		DataDir:         cfg.DataDir,
 		SkillsDir:       cfg.SkillsDir(),
 		Timezone:        cfg.Timezone,
 		DB:              db,
+		Sender:          sender,
 		ClawHubEnabled:  cfg.ClawHubAgentToolsEnabled,
 		ClawHubRegistry: cfg.ClawHubRegistry,
 		ClawHubToken:    cfg.ClawHubToken,

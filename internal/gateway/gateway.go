@@ -44,6 +44,8 @@ func Run(args []string) error {
 		return start()
 	case "stop":
 		return stop()
+	case "restart":
+		return restart()
 	case "status":
 		return status()
 	case "logs":
@@ -73,6 +75,7 @@ Subcommands:
   uninstall   Stop and remove the gateway service
   start       Start the gateway service
   stop        Stop the gateway service
+  restart     Restart the gateway service
   status      Show service status
   logs [N]    Show last N lines of logs (default 50)
   help        Show this help`)
@@ -239,6 +242,17 @@ func stop() error {
 		return stopDarwin()
 	case "linux":
 		return stopLinux()
+	default:
+		return fmt.Errorf("gateway service not supported on %s", runtime.GOOS)
+	}
+}
+
+func restart() error {
+	switch runtime.GOOS {
+	case "darwin":
+		return restartDarwin()
+	case "linux":
+		return restartLinux()
 	default:
 		return fmt.Errorf("gateway service not supported on %s", runtime.GOOS)
 	}

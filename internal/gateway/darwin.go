@@ -152,6 +152,15 @@ func startDarwin() error {
 	return nil
 }
 
+func restartDarwin() error {
+	cmd := exec.Command("launchctl", "kickstart", "-k", serviceTarget())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl kickstart: %s (%w)", string(out), err)
+	}
+	fmt.Println("Gateway service restarted.")
+	return nil
+}
+
 func stopDarwin() error {
 	cmd := exec.Command("launchctl", "kill", "SIGTERM", serviceTarget())
 	if out, err := cmd.CombinedOutput(); err != nil {

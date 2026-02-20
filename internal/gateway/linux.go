@@ -126,6 +126,15 @@ func startLinux() error {
 	return nil
 }
 
+func restartLinux() error {
+	cmd := exec.Command("systemctl", "--user", "restart", serviceName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl restart: %s (%w)", string(out), err)
+	}
+	fmt.Println("Gateway service restarted.")
+	return nil
+}
+
 func stopLinux() error {
 	cmd := exec.Command("systemctl", "--user", "stop", serviceName)
 	if out, err := cmd.CombinedOutput(); err != nil {
