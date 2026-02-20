@@ -57,14 +57,6 @@ func RunSetup() error {
 		tgUsername = strings.TrimSpace(tgUsername)
 	}
 
-	// Web UI.
-	fmt.Print("Enable web UI? (y/n) [y]: ")
-	webEnabled, _ := reader.ReadString('\n')
-	webEnabled = strings.TrimSpace(webEnabled)
-	if webEnabled == "" {
-		webEnabled = "y"
-	}
-
 	// Write config.
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("llm_provider: %q\n", provider))
@@ -78,12 +70,6 @@ func RunSetup() error {
 	if tgToken != "" {
 		sb.WriteString(fmt.Sprintf("telegram_bot_token: %q\n", tgToken))
 		sb.WriteString(fmt.Sprintf("bot_username: %q\n", tgUsername))
-	}
-
-	if strings.ToLower(webEnabled) == "y" || strings.ToLower(webEnabled) == "yes" {
-		sb.WriteString("web_enabled: true\n")
-		sb.WriteString("web_host: \"127.0.0.1\"\n")
-		sb.WriteString("web_port: 10961\n")
 	}
 
 	configPath := "miniclawd.config.yaml"

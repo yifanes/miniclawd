@@ -127,7 +127,7 @@ func DefaultConfig() Config {
 		WorkingDir:              "./tmp",
 		WorkingDirIsolation:     IsolationChat,
 		Timezone:                "UTC",
-		WebEnabled:              true,
+		WebEnabled:              false,
 		WebHost:                 "127.0.0.1",
 		WebPort:                 10961,
 		WebMaxInflightPerSession: 2,

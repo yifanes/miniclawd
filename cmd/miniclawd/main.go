@@ -3,10 +3,13 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/yifanes/miniclawd/internal/app"
 	"github.com/yifanes/miniclawd/internal/config"
+	"github.com/yifanes/miniclawd/internal/gateway"
 	"github.com/yifanes/miniclawd/internal/hooks"
+	"github.com/yifanes/miniclawd/internal/logging"
 )
 
 var version = "dev"
@@ -24,6 +27,8 @@ func Run() int {
 		return runSetup()
 	case "doctor":
 		return runDoctor()
+	case "gateway":
+		return runGateway()
 	case "hooks":
 		return runHooks()
 	case "version":
@@ -49,6 +54,7 @@ Commands:
   start     Start the bot
   setup     Interactive setup wizard
   doctor    Run preflight diagnostics
+  gateway   Manage background gateway service
   hooks     Manage hooks (list, enable, disable)
   version   Print version
   help      Show this help`)
@@ -62,8 +68,26 @@ func runStart() int {
 	}
 	defer db.Close()
 
+	// In gateway mode, redirect logs to hourly-rotated files.
+	if os.Getenv("MINICLAWD_GATEWAY") != "" {
+		logsDir := filepath.Join(cfg.RuntimeDir(), "logs")
+		if err := logging.InitFileLogging(logsDir); err != nil {
+			fmt.Fprintf(os.Stderr, "logging init error: %v\n", err)
+			return 1
+		}
+	}
+
 	if err := app.Run(cfg, db); err != nil {
 		fmt.Fprintf(os.Stderr, "runtime error: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runGateway() int {
+	args := os.Args[2:]
+	if err := gateway.Run(args); err != nil {
+		fmt.Fprintf(os.Stderr, "gateway error: %v\n", err)
 		return 1
 	}
 	return 0
