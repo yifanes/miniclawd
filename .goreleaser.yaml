@@ -15,7 +15,7 @@ builds:
       - amd64
       - arm64
     ldflags:
-      - -s -w
+      - -s -w -X github.com/yifanes/miniclawd/cmd/miniclawd.version={{.Version}}
 
 archives:
   - formats:
@@ -31,6 +31,18 @@ checksum:
 
 changelog:
   sort: asc
+
+brews:
+  - repository:
+      owner: yifanes
+      name: homebrew-tap
+    homepage: https://github.com/yifanes/miniclawd
+    description: Multi-platform AI chat bot
+    license: MIT
+    install: |
+      bin.install "miniclawd"
+    test: |
+      system "#{bin}/miniclawd", "version"
 
 release:
   github:

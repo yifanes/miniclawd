@@ -9,7 +9,7 @@ import (
 	"github.com/yifanes/miniclawd/internal/hooks"
 )
 
-const version = "0.1.0"
+var version = "dev"
 
 func Run() int {
 	if len(os.Args) < 2 {
