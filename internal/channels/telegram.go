@@ -180,8 +180,12 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 	if content == "" && msg.Caption != "" {
 		content = msg.Caption
 	}
-	if content == "" {
+	hasPhoto := msg.Photo != nil && len(msg.Photo) > 0
+	if content == "" && !hasPhoto {
 		return
+	}
+	if content == "" && hasPhoto {
+		content = "请描述这张图片"
 	}
 
 	senderName := msg.From.FirstName
