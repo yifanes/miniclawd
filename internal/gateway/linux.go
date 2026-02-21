@@ -74,6 +74,20 @@ func installLinux(ctx *ServiceContext) error {
 
 	fmt.Printf("Service file written to %s\n", svcPath)
 
+	// Enable linger so user services survive SSH logout.
+	currentUser := os.Getenv("USER")
+	if currentUser == "" {
+		currentUser = "root"
+	}
+	linger := exec.Command("loginctl", "enable-linger", currentUser)
+	if out, err := linger.CombinedOutput(); err != nil {
+		fmt.Printf("Warning: failed to enable linger: %s (%v)\n", strings.TrimSpace(string(out)), err)
+		fmt.Println("Without linger, the service will stop when you log out.")
+		fmt.Println("Run manually: loginctl enable-linger", currentUser)
+	} else {
+		fmt.Println("Linger enabled: service will persist after logout.")
+	}
+
 	// Reload systemd and enable/start the service.
 	commands := [][]string{
 		{"systemctl", "--user", "daemon-reload"},
