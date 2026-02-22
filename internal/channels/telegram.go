@@ -339,14 +339,60 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// escapeMarkdownV2 escapes special characters for Telegram MarkdownV2.
+// escapeMarkdownV2 converts text to Telegram MarkdownV2 format.
+// Fenced code blocks (```) and inline code spans (`) are preserved with their
+// content correctly escaped per Telegram spec (only \ and ` inside code).
+// All other MarkdownV2 special characters are escaped in regular text regions.
 func escapeMarkdownV2(text string) string {
-	// Simplified: escape most special chars outside of code blocks.
-	// A full implementation would track fenced/inline code blocks.
-	special := []string{"_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"}
-	result := text
-	for _, ch := range special {
-		result = strings.ReplaceAll(result, ch, "\\"+ch)
+	var buf strings.Builder
+	i := 0
+	n := len(text)
+	for i < n {
+		// Fenced code block: ```[lang]\n...\n```
+		if i+2 < n && text[i] == '`' && text[i+1] == '`' && text[i+2] == '`' {
+			end := strings.Index(text[i+3:], "```")
+			if end >= 0 {
+				// Per Telegram spec, inside pre/code only \ and ` must be escaped.
+				content := text[i+3 : i+3+end]
+				content = strings.ReplaceAll(content, `\`, `\\`)
+				content = strings.ReplaceAll(content, "`", "\\`")
+				buf.WriteString("```")
+				buf.WriteString(content)
+				buf.WriteString("```")
+				i += 3 + end + 3
+				continue
+			}
+			// Unclosed block: escape each backtick individually and move on.
+			buf.WriteString("\\`\\`\\`")
+			i += 3
+			continue
+		}
+		// Inline code span: `...`
+		if text[i] == '`' {
+			end := strings.IndexByte(text[i+1:], '`')
+			if end >= 0 {
+				content := text[i+1 : i+1+end]
+				content = strings.ReplaceAll(content, `\`, `\\`)
+				content = strings.ReplaceAll(content, "`", "\\`")
+				buf.WriteByte('`')
+				buf.WriteString(content)
+				buf.WriteByte('`')
+				i += 2 + end
+				continue
+			}
+			buf.WriteString("\\`")
+			i++
+			continue
+		}
+		// Regular text: escape all MarkdownV2 special characters.
+		// \ must be escaped first to avoid double-escaping subsequent chars.
+		c := text[i]
+		switch c {
+		case '\\', '_', '*', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!':
+			buf.WriteByte('\\')
+		}
+		buf.WriteByte(c)
+		i++
 	}
-	return result
+	return buf.String()
 }
