@@ -39,6 +39,18 @@ func RunDoctor(cfg *config.Config) []Check {
 		checks = append(checks, Check{Name: "telegram_token", Status: "warn", Detail: "No Telegram token set"})
 	}
 
+	// Check Discord bot token.
+	if cfg.DiscordBotToken != nil && *cfg.DiscordBotToken != "" {
+		detail := "Token configured"
+		if cfg.DiscordNoMention {
+			detail += " (no-mention mode)"
+		}
+		if len(cfg.DiscordAllowedChannels) > 0 {
+			detail += fmt.Sprintf(", %d allowed channel(s)", len(cfg.DiscordAllowedChannels))
+		}
+		checks = append(checks, Check{Name: "discord_token", Status: "ok", Detail: detail})
+	}
+
 	// Check optional tools.
 	checks = append(checks, checkBinary("bash"))
 	checks = append(checks, checkBinary("git"))

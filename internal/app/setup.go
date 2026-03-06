@@ -57,6 +57,19 @@ func RunSetup() error {
 		tgUsername = strings.TrimSpace(tgUsername)
 	}
 
+	// Discord.
+	fmt.Print("Discord bot token (leave empty to skip): ")
+	dcToken, _ := reader.ReadString('\n')
+	dcToken = strings.TrimSpace(dcToken)
+
+	dcNoMention := false
+	if dcToken != "" {
+		fmt.Print("Respond in servers without @mention? (y/N): ")
+		dcNoMentionStr, _ := reader.ReadString('\n')
+		dcNoMentionStr = strings.ToLower(strings.TrimSpace(dcNoMentionStr))
+		dcNoMention = dcNoMentionStr == "y" || dcNoMentionStr == "yes"
+	}
+
 	// Write config.
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("llm_provider: %q\n", provider))
@@ -70,6 +83,13 @@ func RunSetup() error {
 	if tgToken != "" {
 		sb.WriteString(fmt.Sprintf("telegram_bot_token: %q\n", tgToken))
 		sb.WriteString(fmt.Sprintf("bot_username: %q\n", tgUsername))
+	}
+
+	if dcToken != "" {
+		sb.WriteString(fmt.Sprintf("discord_bot_token: %q\n", dcToken))
+		if dcNoMention {
+			sb.WriteString("discord_no_mention: true\n")
+		}
 	}
 
 	configPath := "miniclawd.config.yaml"

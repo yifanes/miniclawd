@@ -112,6 +112,19 @@ func Run(cfg *config.Config, db *storage.Database) error {
 		}
 	}
 
+	// Register Discord adapter.
+	var discordAdapter *channels.DiscordAdapter
+	if cfg.DiscordBotToken != nil && *cfg.DiscordBotToken != "" {
+		var err error
+		discordAdapter, err = channels.NewDiscordAdapter(*cfg.DiscordBotToken, cfg.DiscordAllowedChannels, cfg.DiscordNoMention)
+		if err != nil {
+			log.Printf("[app] discord adapter error: %v", err)
+		} else {
+			registry.Register(discordAdapter)
+			log.Printf("[app] discord: adapter registered")
+		}
+	}
+
 	// Build working directory.
 	workingDir := cfg.WorkingDir
 	os.MkdirAll(workingDir, 0o755)
@@ -173,13 +186,30 @@ func Run(cfg *config.Config, db *storage.Database) error {
 		}()
 	}
 
-	// Start Telegram bot (blocking).
-	if telegramAdapter != nil {
+	// Start Discord bot in a goroutine (non-blocking open + event-driven).
+	if discordAdapter != nil {
+		go func() {
+			log.Println("[app] starting discord websocket...")
+			if err := channels.StartDiscordBot(ctx, discordAdapter, db, deps); err != nil && ctx.Err() == nil {
+				log.Printf("[app] discord bot error: %v", err)
+			}
+		}()
+	}
+
+	// Start Telegram bot. If it's the only foreground channel, run it blocking;
+	// otherwise run in a goroutine and wait on ctx.
+	if telegramAdapter != nil && discordAdapter == nil && !cfg.WebEnabled {
 		log.Println("[app] starting telegram long-poll (blocking)...")
 		channels.StartTelegramBot(ctx, telegramAdapter, db, deps)
+	} else if telegramAdapter != nil {
+		go func() {
+			log.Println("[app] starting telegram long-poll...")
+			channels.StartTelegramBot(ctx, telegramAdapter, db, deps)
+		}()
+		log.Println("[app] running. Press Ctrl+C to stop.")
+		<-ctx.Done()
 	} else {
-		// No telegram: wait for signal.
-		log.Println("[app] running (no telegram). Press Ctrl+C to stop.")
+		log.Println("[app] running. Press Ctrl+C to stop.")
 		<-ctx.Done()
 	}
 

@@ -3,3 +3,5 @@ miniclawd.config.yml
 miniclawd.data
 tmp
 dist
+.idea/
+CLAUDE.md

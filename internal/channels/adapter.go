@@ -137,7 +137,7 @@ func SessionSourceForChat(chatType string) string {
 		return "unknown"
 	}
 	// Strip suffixes like "_group", "_dm", "_private"
-	for _, suffix := range []string{"_group", "_dm", "_private", "_supergroup", "_channel"} {
+	for _, suffix := range []string{"_group", "_dm", "_private", "_supergroup", "_channel", "_guild"} {
 		if idx := len(chatType) - len(suffix); idx > 0 && chatType[idx:] == suffix {
 			return chatType[:idx]
 		}
