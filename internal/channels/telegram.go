@@ -256,9 +256,14 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 	// Check for photo.
 	var imageData *agent.ImageData
 	if msg.Photo != nil && len(msg.Photo) > 0 {
-		// Get the largest photo.
 		photo := msg.Photo[len(msg.Photo)-1]
-		imageData = downloadTelegramPhoto(adapter.bot, photo.FileID)
+		var imgErr error
+		imageData, imgErr = downloadTelegramPhoto(adapter.bot, photo.FileID)
+		if imgErr != nil {
+			reply := tgbotapi.NewMessage(msg.Chat.ID, imgErr.Error())
+			adapter.bot.Send(reply)
+			return
+		}
 	}
 
 	// Process with agent.
@@ -273,7 +278,7 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 
 	if err != nil {
 		log.Printf("[telegram] agent error for chat %d: %v", chatID, err)
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "Sorry, I encountered an error processing your message.")
+		reply := tgbotapi.NewMessage(msg.Chat.ID, core.UserFacingError(err))
 		adapter.bot.Send(reply)
 		return
 	}
@@ -304,21 +309,28 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 	})
 }
 
-func downloadTelegramPhoto(bot *tgbotapi.BotAPI, fileID string) *agent.ImageData {
+var supportedImageTypes = map[string]bool{
+	"image/jpeg": true,
+	"image/png":  true,
+	"image/gif":  true,
+	"image/webp": true,
+}
+
+func downloadTelegramPhoto(bot *tgbotapi.BotAPI, fileID string) (*agent.ImageData, error) {
 	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("无法获取图片: %v", err)
 	}
 	url := file.Link(bot.Token)
 	resp, err := http.Get(url)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("无法下载图片: %v", err)
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("读取图片失败: %v", err)
 	}
 
 	mediaType := "image/jpeg"
@@ -326,10 +338,14 @@ func downloadTelegramPhoto(bot *tgbotapi.BotAPI, fileID string) *agent.ImageData
 		mediaType = ct
 	}
 
+	if !supportedImageTypes[mediaType] {
+		return nil, fmt.Errorf("不支持的图片格式: %s，请使用 JPEG/PNG/GIF/WebP 格式的图片。", mediaType)
+	}
+
 	return &agent.ImageData{
 		MediaType: mediaType,
 		Base64:    base64.StdEncoding.EncodeToString(data),
-	}
+	}, nil
 }
 
 func truncate(s string, n int) string {

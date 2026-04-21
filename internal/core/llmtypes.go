@@ -116,6 +116,10 @@ func ToolResultBlock(toolUseID, content string, isError bool) ContentBlock {
 	var errPtr *bool
 	if isError {
 		errPtr = &isError
+		// Anthropic API rejects tool_result with is_error=true and empty content.
+		if content == "" {
+			content = "tool execution failed"
+		}
 	}
 	return ContentBlock{
 		Type:      "tool_result",

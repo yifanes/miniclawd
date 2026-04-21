@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -41,6 +42,15 @@ func runDueTasks(ctx context.Context, db *storage.Database, deps *agent.AgentDep
 	}
 
 	for _, task := range tasks {
+		// Advance next_run BEFORE spawning goroutine to prevent duplicate execution.
+		// The scheduler polls every 60s, but LLM calls can take 60-180s, so without
+		// this the same task gets fetched and executed again on the next poll.
+		if task.ScheduleType == "cron" {
+			nextRun, cronErr := tools.ComputeNextCronExported(task.ScheduleValue, deps.Config.Timezone)
+			if cronErr == nil {
+				db.UpdateTaskAfterRun(task.ID, now, nextRun)
+			}
+		}
 		go executeTask(ctx, db, deps, registry, task)
 	}
 }
@@ -85,14 +95,9 @@ func executeTask(ctx context.Context, db *storage.Database, deps *agent.AgentDep
 		deliverResponse(ctx, db, registry, task.ChatID, response, deps.Config.BotUsername)
 	}
 
-	// Compute next run.
-	if task.ScheduleType == "cron" {
-		nextRun, err := tools.ComputeNextCronExported(task.ScheduleValue, deps.Config.Timezone)
-		if err == nil {
-			db.UpdateTaskAfterRun(task.ID, finishedAt.Format(time.RFC3339), nextRun)
-		}
-	} else {
-		// One-shot: mark as completed.
+	// One-shot tasks: mark as completed. Cron tasks already had next_run
+	// advanced in runDueTasks() before the goroutine was spawned.
+	if task.ScheduleType != "cron" {
 		db.UpdateTaskStatus(task.ID, "completed")
 	}
 }
@@ -118,7 +123,7 @@ func deliverResponse(ctx context.Context, db *storage.Database, registry *channe
 
 	// Store bot message.
 	db.StoreMessage(storage.StoredMessage{
-		ID:         "sched_" + time.Now().UTC().Format("20060102150405"),
+		ID:         fmt.Sprintf("sched_%d", time.Now().UnixNano()),
 		ChatID:     chatID,
 		SenderName: botUsername,
 		Content:    text,

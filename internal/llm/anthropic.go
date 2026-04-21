@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/yifanes/miniclawd/internal/core"
 )
@@ -67,38 +69,68 @@ func (p *AnthropicProvider) doRequest(ctx context.Context, system string, messag
 		return nil, fmt.Errorf("marshalling request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", p.apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
+	const maxRetries = 3
+	backoffs := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
 
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http request: %w", err)
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("[anthropic] retry %d/%d after error: %v", attempt, maxRetries-1, lastErr)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoffs[attempt-1]):
+			}
+		}
 
-	if resp.StatusCode == 429 {
-		io.Copy(io.Discard, resp.Body)
-		return nil, core.ErrRateLimited
-	}
-	if resp.StatusCode != 200 {
-		errBody, _ := io.ReadAll(resp.Body)
-		return nil, core.NewLLMErrorf("anthropic API error (status %d): %s", resp.StatusCode, string(errBody))
+		req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, fmt.Errorf("creating request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", p.apiKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+
+		resp, err := p.client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("http request: %w", err)
+			continue // network error, retry
+		}
+
+		if resp.StatusCode == 429 {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			lastErr = core.ErrRateLimited
+			continue // rate limited, retry
+		}
+		if resp.StatusCode >= 500 {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = core.NewLLMErrorf("anthropic API error (status %d): %s", resp.StatusCode, string(errBody))
+			continue // server error, retry
+		}
+		if resp.StatusCode != 200 {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, core.NewLLMErrorf("anthropic API error (status %d): %s", resp.StatusCode, string(errBody))
+		}
+
+		// Success path.
+		if stream {
+			result, parseErr := p.parseSSE(resp.Body, onDelta)
+			resp.Body.Close()
+			return result, parseErr
+		}
+		var result core.MessagesResponse
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("decoding response: %w", err)
+		}
+		resp.Body.Close()
+		return &result, nil
 	}
 
-	if stream {
-		return p.parseSSE(resp.Body, onDelta)
-	}
-
-	var result core.MessagesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
-	}
-	return &result, nil
+	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 // parseSSE processes Anthropic SSE stream events.

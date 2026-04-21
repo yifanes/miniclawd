@@ -260,7 +260,7 @@ func handleDiscordMessage(ctx context.Context, adapter *DiscordAdapter, db *stor
 
 	if err != nil {
 		log.Printf("[discord] agent error for chat %d: %v", chatID, err)
-		s.ChannelMessageSend(msg.ChannelID, "Sorry, I encountered an error processing your message.")
+		s.ChannelMessageSend(msg.ChannelID, core.UserFacingError(err))
 		return
 	}
 
