@@ -78,9 +78,54 @@ type Config struct {
 	Channels map[string]yaml.Node `yaml:"channels"`
 
 	// Legacy channel fields
-	TelegramBotToken string  `yaml:"telegram_bot_token"`
-	BotUsername       string  `yaml:"bot_username"`
-	AllowedGroups    []int64 `yaml:"allowed_groups"`
+	TelegramBotToken   string  `yaml:"telegram_bot_token"`
+	BotUsername         string  `yaml:"bot_username"`
+	AllowedGroups      []int64 `yaml:"allowed_groups"`
+	AllowedUserIDs     []int64 `yaml:"allowed_user_ids"`
+	TopicRoutingEnabled bool   `yaml:"topic_routing_enabled"`
+}
+
+// TelegramAccountConfig holds per-account Telegram settings.
+type TelegramAccountConfig struct {
+	Enabled        bool    `yaml:"enabled"`
+	BotToken       string  `yaml:"bot_token"`
+	BotUsername    string  `yaml:"bot_username"`
+	AllowedGroups  []int64 `yaml:"allowed_groups"`
+	AllowedUserIDs []int64 `yaml:"allowed_user_ids"`
+	Model          *string `yaml:"model"`
+}
+
+// TelegramChannelConfig holds the full Telegram channel configuration.
+type TelegramChannelConfig struct {
+	Enabled        bool                              `yaml:"enabled"`
+	BotToken       string                            `yaml:"bot_token"`
+	BotUsername    string                            `yaml:"bot_username"`
+	AllowedGroups  []int64                           `yaml:"allowed_groups"`
+	AllowedUserIDs []int64                           `yaml:"allowed_user_ids"`
+	Model          *string                           `yaml:"model"`
+	DefaultAccount string                            `yaml:"default_account"`
+	Accounts       map[string]TelegramAccountConfig  `yaml:"accounts"`
+}
+
+// DiscordAccountConfig holds per-account Discord settings.
+type DiscordAccountConfig struct {
+	Enabled         bool     `yaml:"enabled"`
+	BotToken        string   `yaml:"bot_token"`
+	AllowedChannels []uint64 `yaml:"allowed_channels"`
+	NoMention       bool     `yaml:"no_mention"`
+	BotUsername     string   `yaml:"bot_username"`
+	Model           *string  `yaml:"model"`
+}
+
+// DiscordChannelConfig holds the full Discord channel configuration.
+type DiscordChannelConfig struct {
+	Enabled         bool                            `yaml:"enabled"`
+	BotToken        string                          `yaml:"bot_token"`
+	AllowedChannels []uint64                        `yaml:"allowed_channels"`
+	NoMention       bool                            `yaml:"no_mention"`
+	Model           *string                         `yaml:"model"`
+	DefaultAccount  string                          `yaml:"default_account"`
+	Accounts        map[string]DiscordAccountConfig  `yaml:"accounts"`
 }
 
 // WorkingDirIsolation determines how tool working directories are isolated.
@@ -249,6 +294,101 @@ func (c *Config) Validate() error {
 
 func isLocalHost(host string) bool {
 	return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == ""
+}
+
+// GetTelegramConfigs returns all effective Telegram account configurations.
+// It merges legacy flat config with the channels map.
+func (c *Config) GetTelegramConfigs() map[string]TelegramAccountConfig {
+	result := make(map[string]TelegramAccountConfig)
+
+	// Try channels map first.
+	if node, ok := c.Channels["telegram"]; ok {
+		var tgCfg TelegramChannelConfig
+		data, _ := yaml.Marshal(&node)
+		if err := yaml.Unmarshal(data, &tgCfg); err == nil {
+			if len(tgCfg.Accounts) > 0 {
+				for name, acct := range tgCfg.Accounts {
+					if !acct.Enabled {
+						continue
+					}
+					if acct.BotToken == "" {
+						continue
+					}
+					result[name] = acct
+				}
+				return result
+			}
+			// No accounts map — use top-level channel fields.
+			if tgCfg.BotToken != "" {
+				result["default"] = TelegramAccountConfig{
+					Enabled:        true,
+					BotToken:       tgCfg.BotToken,
+					BotUsername:    tgCfg.BotUsername,
+					AllowedGroups:  tgCfg.AllowedGroups,
+					AllowedUserIDs: tgCfg.AllowedUserIDs,
+					Model:          tgCfg.Model,
+				}
+				return result
+			}
+		}
+	}
+
+	// Fall back to legacy flat fields.
+	if c.TelegramBotToken != "" {
+		result["default"] = TelegramAccountConfig{
+			Enabled:        true,
+			BotToken:       c.TelegramBotToken,
+			BotUsername:    c.BotUsername,
+			AllowedGroups:  c.AllowedGroups,
+			AllowedUserIDs: c.AllowedUserIDs,
+		}
+	}
+	return result
+}
+
+// GetDiscordConfigs returns all effective Discord account configurations.
+func (c *Config) GetDiscordConfigs() map[string]DiscordAccountConfig {
+	result := make(map[string]DiscordAccountConfig)
+
+	// Try channels map first.
+	if node, ok := c.Channels["discord"]; ok {
+		var dcCfg DiscordChannelConfig
+		data, _ := yaml.Marshal(&node)
+		if err := yaml.Unmarshal(data, &dcCfg); err == nil {
+			if len(dcCfg.Accounts) > 0 {
+				for name, acct := range dcCfg.Accounts {
+					if !acct.Enabled {
+						continue
+					}
+					if acct.BotToken == "" {
+						continue
+					}
+					result[name] = acct
+				}
+				return result
+			}
+			if dcCfg.BotToken != "" {
+				result["default"] = DiscordAccountConfig{
+					Enabled:         true,
+					BotToken:        dcCfg.BotToken,
+					AllowedChannels: dcCfg.AllowedChannels,
+					NoMention:       dcCfg.NoMention,
+				}
+				return result
+			}
+		}
+	}
+
+	// Fall back to legacy flat fields.
+	if c.DiscordBotToken != nil && *c.DiscordBotToken != "" {
+		result["default"] = DiscordAccountConfig{
+			Enabled:         true,
+			BotToken:        *c.DiscordBotToken,
+			AllowedChannels: c.DiscordAllowedChannels,
+			NoMention:       c.DiscordNoMention,
+		}
+	}
+	return result
 }
 
 // RuntimeDir returns the runtime directory path.

@@ -18,6 +18,7 @@ import (
 	"github.com/yifanes/miniclawd/internal/skills"
 	"github.com/yifanes/miniclawd/internal/storage"
 	"github.com/yifanes/miniclawd/internal/tools"
+	"github.com/yifanes/miniclawd/internal/turnqueue"
 	"github.com/yifanes/miniclawd/internal/web"
 )
 
@@ -99,29 +100,35 @@ func Run(cfg *config.Config, db *storage.Database) error {
 		registry.Register(channels.NewWebAdapter())
 	}
 
-	// Register Telegram adapter.
+	// Register Telegram adapter (multi-account).
 	var telegramAdapter *channels.TelegramAdapter
-	if cfg.TelegramBotToken != "" {
+	tgConfigs := cfg.GetTelegramConfigs()
+	if len(tgConfigs) > 0 {
 		var err error
-		telegramAdapter, err = channels.NewTelegramAdapter(cfg.TelegramBotToken, cfg.BotUsername, cfg.AllowedGroups)
+		telegramAdapter, err = channels.NewTelegramAdapterMulti(tgConfigs)
 		if err != nil {
 			log.Printf("[app] telegram adapter error: %v", err)
 		} else {
 			registry.Register(telegramAdapter)
-			log.Printf("[app] telegram: @%s", cfg.BotUsername)
+			for name := range tgConfigs {
+				log.Printf("[app] telegram: account %q registered", name)
+			}
 		}
 	}
 
-	// Register Discord adapter.
+	// Register Discord adapter (multi-account).
 	var discordAdapter *channels.DiscordAdapter
-	if cfg.DiscordBotToken != nil && *cfg.DiscordBotToken != "" {
+	dcConfigs := cfg.GetDiscordConfigs()
+	if len(dcConfigs) > 0 {
 		var err error
-		discordAdapter, err = channels.NewDiscordAdapter(*cfg.DiscordBotToken, cfg.DiscordAllowedChannels, cfg.DiscordNoMention)
+		discordAdapter, err = channels.NewDiscordAdapterMulti(dcConfigs)
 		if err != nil {
 			log.Printf("[app] discord adapter error: %v", err)
 		} else {
 			registry.Register(discordAdapter)
-			log.Printf("[app] discord: adapter registered")
+			for name := range dcConfigs {
+				log.Printf("[app] discord: account %q registered", name)
+			}
 		}
 	}
 
@@ -141,6 +148,7 @@ func Run(cfg *config.Config, db *storage.Database) error {
 		ClawHubEnabled:  cfg.ClawHubAgentToolsEnabled,
 		ClawHubRegistry: cfg.ClawHubRegistry,
 		ClawHubToken:    cfg.ClawHubToken,
+		ControlChatIDs:  cfg.ControlChatIDs,
 	})
 	log.Printf("[app] tools: %d registered", len(toolRegistry.ToolNames()))
 
@@ -167,6 +175,9 @@ func Run(cfg *config.Config, db *storage.Database) error {
 	}
 	_ = state
 
+	// Create turn queue for per-chat serialization.
+	tq := turnqueue.New(20)
+
 	// Spawn scheduler.
 	scheduler.SpawnScheduler(ctx, db, deps, registry)
 	log.Println("[app] scheduler started")
@@ -190,7 +201,7 @@ func Run(cfg *config.Config, db *storage.Database) error {
 	if discordAdapter != nil {
 		go func() {
 			log.Println("[app] starting discord websocket...")
-			if err := channels.StartDiscordBot(ctx, discordAdapter, db, deps); err != nil && ctx.Err() == nil {
+			if err := channels.StartDiscordBot(ctx, discordAdapter, db, deps, tq); err != nil && ctx.Err() == nil {
 				log.Printf("[app] discord bot error: %v", err)
 			}
 		}()
@@ -200,11 +211,11 @@ func Run(cfg *config.Config, db *storage.Database) error {
 	// otherwise run in a goroutine and wait on ctx.
 	if telegramAdapter != nil && discordAdapter == nil && !cfg.WebEnabled {
 		log.Println("[app] starting telegram long-poll (blocking)...")
-		channels.StartTelegramBot(ctx, telegramAdapter, db, deps)
+		channels.StartTelegramBot(ctx, telegramAdapter, db, deps, tq)
 	} else if telegramAdapter != nil {
 		go func() {
 			log.Println("[app] starting telegram long-poll...")
-			channels.StartTelegramBot(ctx, telegramAdapter, db, deps)
+			channels.StartTelegramBot(ctx, telegramAdapter, db, deps, tq)
 		}()
 		log.Println("[app] running. Press Ctrl+C to stop.")
 		<-ctx.Done()

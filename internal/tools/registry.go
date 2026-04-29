@@ -93,6 +93,9 @@ type RegistryConfig struct {
 	ClawHubEnabled    bool
 	ClawHubRegistry   string
 	ClawHubToken      *string
+
+	// Authorization
+	ControlChatIDs []int64
 }
 
 // BuildStandardRegistry creates the full tool registry with all tools.
@@ -119,6 +122,11 @@ func BuildStandardRegistry(cfg RegistryConfig) *ToolRegistry {
 	r.Register(NewStructuredMemoryDeleteTool(cfg.DB))
 	r.Register(NewStructuredMemoryUpdateTool(cfg.DB))
 
+	// Time tools
+	r.Register(NewGetCurrentTimeTool(cfg.Timezone))
+	r.Register(NewCompareTimeTool(cfg.Timezone))
+	r.Register(NewCalculateTool())
+
 	// Communication
 	r.Register(NewSendMessageTool(cfg.DB, cfg.Sender))
 
@@ -143,6 +151,11 @@ func BuildStandardRegistry(cfg RegistryConfig) *ToolRegistry {
 	// Skills
 	r.Register(NewActivateSkillTool(cfg.SkillsDir))
 	r.Register(NewSyncSkillsTool(cfg.SkillsDir))
+	r.Register(NewSkillManageTool(cfg.SkillsDir, cfg.ControlChatIDs))
+
+	// Knowledge Graph
+	r.Register(NewKnowledgeGraphQueryTool(cfg.DB))
+	r.Register(NewKnowledgeGraphAddTool(cfg.DB))
 
 	// ClawHub
 	if cfg.ClawHubEnabled {

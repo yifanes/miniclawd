@@ -258,35 +258,8 @@ func ProcessWithEvents(ctx context.Context, deps *AgentDeps, reqCtx AgentRequest
 				Content: core.BlocksContent(assistantBlocks),
 			})
 
-			// Execute each tool.
-			var resultBlocks []core.ContentBlock
-			for _, tu := range toolUses {
-				if eventCh != nil {
-					eventCh <- ToolStartEvent(tu.Name)
-				}
-
-				inputPreview := string(tu.Input)
-				if len(inputPreview) > 300 {
-					inputPreview = inputPreview[:300] + "..."
-				}
-				log.Printf("[agent] chat %d: tool %s input: %s", reqCtx.ChatID, tu.Name, inputPreview)
-
-				result := deps.Tools.ExecuteWithAuth(ctx, tu.Name, tu.Input, auth)
-
-				resultPreview := result.Content
-				if len(resultPreview) > 300 {
-					resultPreview = resultPreview[:300] + "..."
-				}
-				log.Printf("[agent] chat %d: tool %s result (err=%v, %dms): %s",
-					reqCtx.ChatID, tu.Name, result.IsError, derefDuration(result.DurationMs), resultPreview)
-
-				if eventCh != nil {
-					eventCh <- ToolResultEvent(tu.Name, result.IsError, resultPreview,
-						derefDuration(result.DurationMs), result.StatusCode, result.Bytes, result.ErrorType)
-				}
-
-				resultBlocks = append(resultBlocks, core.ToolResultBlock(tu.ID, result.Content, result.IsError))
-			}
+			// Execute tools (parallel when possible).
+			resultBlocks := executeToolsConcurrent(ctx, toolUses, deps.Tools, auth, reqCtx.ChatID, eventCh, 5)
 
 			messages = append(messages, core.Message{
 				Role:    "user",

@@ -50,6 +50,7 @@ func (d *Database) runMigrations() error {
 			{6, "session metadata", migrateV6},
 			{7, "metrics history", migrateV7},
 			{8, "audit logs and api key expiration", migrateV8},
+			{9, "knowledge graph triples", migrateV9},
 		}
 
 		for _, m := range migrations {
@@ -366,6 +367,32 @@ func migrateV8(tx *sql.Tx) error {
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_kind_created ON audit_logs(kind, created_at DESC)`,
 		`ALTER TABLE api_keys ADD COLUMN expires_at TEXT`,
 		`ALTER TABLE api_keys ADD COLUMN rotated_from_key_id INTEGER`,
+	}
+	for _, s := range stmts {
+		if _, err := tx.Exec(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateV9 adds the knowledge graph triples table.
+func migrateV9(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS kg_triples (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id INTEGER,
+			subject TEXT NOT NULL,
+			predicate TEXT NOT NULL,
+			object TEXT NOT NULL,
+			valid_from TEXT NOT NULL,
+			valid_to TEXT,
+			source TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_kg_triples_subject ON kg_triples(subject, valid_to)`,
+		`CREATE INDEX IF NOT EXISTS idx_kg_triples_object ON kg_triples(object, valid_to)`,
+		`CREATE INDEX IF NOT EXISTS idx_kg_triples_chat ON kg_triples(chat_id, valid_to)`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(s); err != nil {

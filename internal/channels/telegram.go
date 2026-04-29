@@ -8,38 +8,86 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yifanes/miniclawd/internal/agent"
+	"github.com/yifanes/miniclawd/internal/config"
 	"github.com/yifanes/miniclawd/internal/core"
+	"github.com/yifanes/miniclawd/internal/runcontrol"
 	"github.com/yifanes/miniclawd/internal/storage"
+	"github.com/yifanes/miniclawd/internal/turnqueue"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// TelegramAdapter implements ChannelAdapter for Telegram.
-type TelegramAdapter struct {
-	bot           *tgbotapi.BotAPI
-	botUsername   string
-	allowedGroups []int64
+// TelegramAccount holds a single Telegram bot account's runtime state.
+type TelegramAccount struct {
+	Name           string
+	Bot            *tgbotapi.BotAPI
+	BotUsername    string
+	AllowedGroups  []int64
+	AllowedUserIDs []int64
+	ModelOverride  *string
 }
 
-func NewTelegramAdapter(token, botUsername string, allowedGroups []int64) (*TelegramAdapter, error) {
-	bot, err := tgbotapi.NewBotAPI(token)
-	if err != nil {
-		return nil, fmt.Errorf("creating telegram bot: %w", err)
-	}
+// TelegramAdapter implements ChannelAdapter for Telegram (multi-account).
+type TelegramAdapter struct {
+	accounts map[string]*TelegramAccount
+	// defaultAccount is used for SendText/SendAttachment when no account is specified.
+	defaultAccount *TelegramAccount
+}
 
-	username := botUsername
-	if username == "" {
-		username = bot.Self.UserName
-	}
+// NewTelegramAdapterMulti creates a multi-account Telegram adapter.
+func NewTelegramAdapterMulti(configs map[string]config.TelegramAccountConfig) (*TelegramAdapter, error) {
+	accounts := make(map[string]*TelegramAccount)
+	var defaultAcct *TelegramAccount
 
+	for name, cfg := range configs {
+		if cfg.BotToken == "" {
+			continue
+		}
+		bot, err := tgbotapi.NewBotAPI(cfg.BotToken)
+		if err != nil {
+			return nil, fmt.Errorf("creating telegram bot for account %q: %w", name, err)
+		}
+		username := cfg.BotUsername
+		if username == "" {
+			username = bot.Self.UserName
+		}
+		acct := &TelegramAccount{
+			Name:           name,
+			Bot:            bot,
+			BotUsername:    username,
+			AllowedGroups:  cfg.AllowedGroups,
+			AllowedUserIDs: cfg.AllowedUserIDs,
+			ModelOverride:  cfg.Model,
+		}
+		accounts[name] = acct
+		if defaultAcct == nil {
+			defaultAcct = acct
+		}
+	}
+	if len(accounts) == 0 {
+		return nil, fmt.Errorf("no valid telegram accounts configured")
+	}
 	return &TelegramAdapter{
-		bot:           bot,
-		botUsername:   username,
-		allowedGroups: allowedGroups,
+		accounts:       accounts,
+		defaultAccount: defaultAcct,
 	}, nil
+}
+
+// NewTelegramAdapter creates a single-account adapter (legacy compatibility).
+func NewTelegramAdapter(token, botUsername string, allowedGroups, allowedUserIDs []int64, topicRouting bool) (*TelegramAdapter, error) {
+	return NewTelegramAdapterMulti(map[string]config.TelegramAccountConfig{
+		"default": {
+			Enabled:        true,
+			BotToken:       token,
+			BotUsername:    botUsername,
+			AllowedGroups:  allowedGroups,
+			AllowedUserIDs: allowedUserIDs,
+		},
+	})
 }
 
 func (a *TelegramAdapter) Name() string { return "telegram" }
@@ -56,19 +104,34 @@ func (a *TelegramAdapter) ChatTypeRoutes() map[string]ConversationKind {
 func (a *TelegramAdapter) IsLocalOnly() bool     { return false }
 func (a *TelegramAdapter) AllowsCrossChat() bool  { return true }
 
-func (a *TelegramAdapter) SendText(ctx context.Context, externalChatID, text string) error {
-	var chatID int64
+// parseTelegramExternalChatID parses "chatID" or "chatID:threadID" format.
+func parseTelegramExternalChatID(externalChatID string) (chatID int64, threadID int, hasThread bool) {
+	if idx := strings.IndexByte(externalChatID, ':'); idx >= 0 {
+		fmt.Sscanf(externalChatID[:idx], "%d", &chatID)
+		fmt.Sscanf(externalChatID[idx+1:], "%d", &threadID)
+		hasThread = threadID != 0
+		return
+	}
 	fmt.Sscanf(externalChatID, "%d", &chatID)
+	return
+}
+
+func (a *TelegramAdapter) SendText(ctx context.Context, externalChatID, text string) error {
+	bot := a.defaultAccount.Bot
+	chatID, threadID, hasThread := parseTelegramExternalChatID(externalChatID)
 
 	chunks := core.SplitText(text, 4096)
 	for _, chunk := range chunks {
 		msg := tgbotapi.NewMessage(chatID, chunk)
 		msg.ParseMode = "MarkdownV2"
-		if _, err := a.bot.Send(msg); err != nil {
+		if hasThread {
+			msg.BaseChat.ReplyToMessageID = threadID
+		}
+		if _, err := bot.Send(msg); err != nil {
 			// Fallback to plain text.
 			msg.ParseMode = ""
 			msg.Text = chunk
-			if _, err := a.bot.Send(msg); err != nil {
+			if _, err := bot.Send(msg); err != nil {
 				return err
 			}
 		}
@@ -77,28 +140,50 @@ func (a *TelegramAdapter) SendText(ctx context.Context, externalChatID, text str
 }
 
 func (a *TelegramAdapter) SendAttachment(ctx context.Context, externalChatID, filePath string, caption *string) (string, error) {
-	var chatID int64
-	fmt.Sscanf(externalChatID, "%d", &chatID)
+	bot := a.defaultAccount.Bot
+	chatID, _, _ := parseTelegramExternalChatID(externalChatID)
 
 	doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filePath))
 	if caption != nil {
 		doc.Caption = *caption
 	}
-	_, err := a.bot.Send(doc)
+	_, err := bot.Send(doc)
 	if err != nil {
 		return "", err
 	}
 	return filePath, nil
 }
 
-// StartTelegramBot runs the Telegram long-poll loop.
-func StartTelegramBot(ctx context.Context, adapter *TelegramAdapter, db *storage.Database, deps *agent.AgentDeps) {
+// StartTelegramBot runs the Telegram long-poll loop for all configured accounts.
+func StartTelegramBot(ctx context.Context, adapter *TelegramAdapter, db *storage.Database, deps *agent.AgentDeps, tq *turnqueue.ChatTurnQueue) {
+	MarkChannelStarted("telegram")
+
+	if len(adapter.accounts) == 1 {
+		// Single account: run blocking in current goroutine.
+		for _, acct := range adapter.accounts {
+			log.Printf("[telegram] bot @%s started", acct.BotUsername)
+			runTelegramPolling(ctx, acct, db, deps, tq)
+		}
+		return
+	}
+
+	// Multi-account: spawn a goroutine per account and wait.
+	var wg sync.WaitGroup
+	for _, acct := range adapter.accounts {
+		wg.Add(1)
+		go func(acct *TelegramAccount) {
+			defer wg.Done()
+			log.Printf("[telegram] bot @%s (account %s) started", acct.BotUsername, acct.Name)
+			runTelegramPolling(ctx, acct, db, deps, tq)
+		}(acct)
+	}
+	wg.Wait()
+}
+
+func runTelegramPolling(ctx context.Context, acct *TelegramAccount, db *storage.Database, deps *agent.AgentDeps, tq *turnqueue.ChatTurnQueue) {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
-
-	updates := adapter.bot.GetUpdatesChan(u)
-
-	log.Printf("[telegram] bot @%s started", adapter.botUsername)
+	updates := acct.Bot.GetUpdatesChan(u)
 
 	for {
 		select {
@@ -108,12 +193,21 @@ func StartTelegramBot(ctx context.Context, adapter *TelegramAdapter, db *storage
 			if update.Message == nil {
 				continue
 			}
-			go handleTelegramMessage(ctx, adapter, db, deps, update.Message)
+			go handleTelegramMessage(ctx, acct, db, deps, tq, update.Message)
 		}
 	}
 }
 
-func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *storage.Database, deps *agent.AgentDeps, msg *tgbotapi.Message) {
+func handleTelegramMessage(ctx context.Context, acct *TelegramAccount, db *storage.Database, deps *agent.AgentDeps, tq *turnqueue.ChatTurnQueue, msg *tgbotapi.Message) {
+	// Startup guard: drop stale/duplicate messages.
+	msgID := FormatTelegramMsgID(msg.MessageID)
+	if ShouldDropPreStartMessage("telegram", msgID, TelegramMessageTimeMs(msg.Date)) {
+		return
+	}
+	if ShouldDropRecentDuplicate("telegram", msgID) {
+		return
+	}
+
 	// Determine chat type.
 	chatType := "telegram_private"
 	switch msg.Chat.Type {
@@ -126,6 +220,8 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 	}
 
 	externalID := fmt.Sprintf("%d", msg.Chat.ID)
+	// Note: Topic routing (forum thread support) requires go-telegram-bot-api with
+	// MessageThreadID field. Currently deferred until library upgrade.
 	title := msg.Chat.Title
 	if title == "" && msg.Chat.FirstName != "" {
 		title = msg.Chat.FirstName
@@ -147,18 +243,18 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 		case "reset":
 			db.ClearChatContext(chatID)
 			reply := tgbotapi.NewMessage(msg.Chat.ID, "Context cleared.")
-			adapter.bot.Send(reply)
+			acct.Bot.Send(reply)
 			return
 		case "usage":
 			summary, _ := db.GetLLMUsageSummary(chatID)
 			text := fmt.Sprintf("Requests: %d\nInput: %d tokens\nOutput: %d tokens\nTotal: %d tokens",
 				summary.Requests, summary.InputTokens, summary.OutputTokens, summary.TotalTokens)
 			reply := tgbotapi.NewMessage(msg.Chat.ID, text)
-			adapter.bot.Send(reply)
+			acct.Bot.Send(reply)
 			return
 		case "skills":
 			reply := tgbotapi.NewMessage(msg.Chat.ID, "Skills: "+deps.Skills)
-			adapter.bot.Send(reply)
+			acct.Bot.Send(reply)
 			return
 		case "archive":
 			messages, _, _, _ := agent.LoadSession(db, chatID)
@@ -166,11 +262,35 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 				agent.ArchiveConversation(deps.Config.DataDir, "telegram", chatID, messages)
 				db.ClearChatContext(chatID)
 				reply := tgbotapi.NewMessage(msg.Chat.ID, "Conversation archived and context cleared.")
-				adapter.bot.Send(reply)
+				acct.Bot.Send(reply)
 			} else {
 				reply := tgbotapi.NewMessage(msg.Chat.ID, "No active session to archive.")
-				adapter.bot.Send(reply)
+				acct.Bot.Send(reply)
 			}
+			return
+		case "stop":
+			stopped := runcontrol.AbortRuns("telegram", chatID)
+			var text string
+			if stopped > 0 {
+				text = fmt.Sprintf("Stopping current run (%d active).", stopped)
+			} else {
+				text = "No active run in this chat."
+			}
+			reply := tgbotapi.NewMessage(msg.Chat.ID, text)
+			acct.Bot.Send(reply)
+			return
+		case "clear":
+			db.ClearChatContext(chatID)
+			reply := tgbotapi.NewMessage(msg.Chat.ID, "Context cleared (session + chat history, scheduled tasks kept).")
+			acct.Bot.Send(reply)
+			return
+		case "status":
+			summary, _ := db.GetLLMUsageSummary(chatID)
+			text := fmt.Sprintf("Provider: %s\nModel: %s\nRequests: %d\nTokens: %d (in: %d, out: %d)",
+				deps.LLM.ProviderName(), deps.LLM.ModelName(),
+				summary.Requests, summary.TotalTokens, summary.InputTokens, summary.OutputTokens)
+			reply := tgbotapi.NewMessage(msg.Chat.ID, text)
+			acct.Bot.Send(reply)
 			return
 		}
 	}
@@ -205,10 +325,24 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 	})
 
 	// Check allowed groups.
-	if len(adapter.allowedGroups) > 0 && chatType != "telegram_private" {
+	if len(acct.AllowedGroups) > 0 && chatType != "telegram_private" {
 		allowed := false
-		for _, gid := range adapter.allowedGroups {
+		for _, gid := range acct.AllowedGroups {
 			if gid == msg.Chat.ID {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return
+		}
+	}
+
+	// Check allowed user IDs for DMs.
+	if len(acct.AllowedUserIDs) > 0 && chatType == "telegram_private" {
+		allowed := false
+		for _, uid := range acct.AllowedUserIDs {
+			if uid == msg.From.ID {
 				allowed = true
 				break
 			}
@@ -222,7 +356,7 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 	shouldRespond := chatType == "telegram_private"
 	if !shouldRespond {
 		// Check for @mention in groups.
-		mention := "@" + adapter.botUsername
+		mention := "@" + acct.BotUsername
 		if strings.Contains(content, mention) {
 			shouldRespond = true
 			content = strings.ReplaceAll(content, mention, "")
@@ -233,6 +367,18 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 	if !shouldRespond {
 		return
 	}
+
+	// Turn queue: serialize agent runs per chat.
+	guard, acquired := tq.TryAcquire("telegram", chatID, &turnqueue.PendingMessage{
+		SenderName: senderName,
+		Content:    content,
+		MessageID:  msgID,
+		Timestamp:  time.Unix(int64(msg.Date), 0).UTC().Format(time.RFC3339),
+	})
+	if !acquired {
+		return // message enqueued, will be processed after current run
+	}
+	defer guard.Release()
 
 	// Start typing indicator.
 	typingCtx, cancelTyping := context.WithCancel(ctx)
@@ -245,26 +391,31 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 				return
 			case <-ticker.C:
 				action := tgbotapi.NewChatAction(msg.Chat.ID, tgbotapi.ChatTyping)
-				adapter.bot.Send(action)
+				acct.Bot.Send(action)
 			}
 		}
 	}()
 	// Send initial typing.
 	action := tgbotapi.NewChatAction(msg.Chat.ID, tgbotapi.ChatTyping)
-	adapter.bot.Send(action)
+	acct.Bot.Send(action)
 
 	// Check for photo.
 	var imageData *agent.ImageData
 	if msg.Photo != nil && len(msg.Photo) > 0 {
 		photo := msg.Photo[len(msg.Photo)-1]
 		var imgErr error
-		imageData, imgErr = downloadTelegramPhoto(adapter.bot, photo.FileID)
+		imageData, imgErr = downloadTelegramPhoto(acct.Bot, photo.FileID)
 		if imgErr != nil {
 			reply := tgbotapi.NewMessage(msg.Chat.ID, imgErr.Error())
-			adapter.bot.Send(reply)
+			acct.Bot.Send(reply)
 			return
 		}
 	}
+
+	// Register run for cancellation support.
+	runID, runCtx, runCancel := runcontrol.RegisterRun(ctx, "telegram", chatID, msgID)
+	defer runCancel()
+	defer runcontrol.UnregisterRun("telegram", chatID, runID)
 
 	// Process with agent.
 	reqCtx := agent.AgentRequestContext{
@@ -273,13 +424,13 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 		ChatType:      chatType,
 	}
 
-	response, err := agent.ProcessWithAgent(ctx, deps, reqCtx, nil, imageData)
+	response, err := agent.ProcessWithAgent(runCtx, deps, reqCtx, nil, imageData)
 	cancelTyping()
 
 	if err != nil {
 		log.Printf("[telegram] agent error for chat %d: %v", chatID, err)
 		reply := tgbotapi.NewMessage(msg.Chat.ID, core.UserFacingError(err))
-		adapter.bot.Send(reply)
+		acct.Bot.Send(reply)
 		return
 	}
 
@@ -290,11 +441,11 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 	for _, chunk := range chunks {
 		reply := tgbotapi.NewMessage(msg.Chat.ID, escapeMarkdownV2(chunk))
 		reply.ParseMode = "MarkdownV2"
-		if _, err := adapter.bot.Send(reply); err != nil {
+		if _, err := acct.Bot.Send(reply); err != nil {
 			// Fallback to plain text.
 			reply.ParseMode = ""
 			reply.Text = chunk
-			adapter.bot.Send(reply)
+			acct.Bot.Send(reply)
 		}
 	}
 
@@ -302,7 +453,7 @@ func handleTelegramMessage(ctx context.Context, adapter *TelegramAdapter, db *st
 	db.StoreMessage(storage.StoredMessage{
 		ID:         fmt.Sprintf("tg_bot_%d", time.Now().UnixNano()),
 		ChatID:     chatID,
-		SenderName: adapter.botUsername,
+		SenderName: acct.BotUsername,
 		Content:    response,
 		IsFromBot:  true,
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),

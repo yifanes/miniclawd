@@ -14,31 +14,75 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/yifanes/miniclawd/internal/agent"
+	"github.com/yifanes/miniclawd/internal/config"
 	"github.com/yifanes/miniclawd/internal/core"
+	"github.com/yifanes/miniclawd/internal/runcontrol"
 	"github.com/yifanes/miniclawd/internal/storage"
+	"github.com/yifanes/miniclawd/internal/turnqueue"
 )
 
-// DiscordAdapter implements ChannelAdapter for Discord.
-type DiscordAdapter struct {
-	session         *discordgo.Session
-	allowedChannels []uint64
-	noMention       bool
+// DiscordAccount holds a single Discord bot account's runtime state.
+type DiscordAccount struct {
+	Name            string
+	Session         *discordgo.Session
+	AllowedChannels []uint64
+	NoMention       bool
+	ModelOverride   *string
 }
 
-// NewDiscordAdapter creates a new Discord bot session.
-func NewDiscordAdapter(token string, allowedChannels []uint64, noMention bool) (*DiscordAdapter, error) {
-	s, err := discordgo.New("Bot " + token)
-	if err != nil {
-		return nil, fmt.Errorf("creating discord session: %w", err)
+// DiscordAdapter implements ChannelAdapter for Discord (multi-account).
+type DiscordAdapter struct {
+	accounts       map[string]*DiscordAccount
+	defaultAccount *DiscordAccount
+}
+
+// NewDiscordAdapterMulti creates a multi-account Discord adapter.
+func NewDiscordAdapterMulti(configs map[string]config.DiscordAccountConfig) (*DiscordAdapter, error) {
+	accounts := make(map[string]*DiscordAccount)
+	var defaultAcct *DiscordAccount
+
+	for name, cfg := range configs {
+		if cfg.BotToken == "" {
+			continue
+		}
+		s, err := discordgo.New("Bot " + cfg.BotToken)
+		if err != nil {
+			return nil, fmt.Errorf("creating discord session for account %q: %w", name, err)
+		}
+		s.Identify.Intents = discordgo.IntentsGuildMessages |
+			discordgo.IntentsDirectMessages |
+			discordgo.IntentsMessageContent
+		acct := &DiscordAccount{
+			Name:            name,
+			Session:         s,
+			AllowedChannels: cfg.AllowedChannels,
+			NoMention:       cfg.NoMention,
+			ModelOverride:   cfg.Model,
+		}
+		accounts[name] = acct
+		if defaultAcct == nil {
+			defaultAcct = acct
+		}
 	}
-	s.Identify.Intents = discordgo.IntentsGuildMessages |
-		discordgo.IntentsDirectMessages |
-		discordgo.IntentsMessageContent
+	if len(accounts) == 0 {
+		return nil, fmt.Errorf("no valid discord accounts configured")
+	}
 	return &DiscordAdapter{
-		session:         s,
-		allowedChannels: allowedChannels,
-		noMention:       noMention,
+		accounts:       accounts,
+		defaultAccount: defaultAcct,
 	}, nil
+}
+
+// NewDiscordAdapter creates a single-account adapter (legacy compatibility).
+func NewDiscordAdapter(token string, allowedChannels []uint64, noMention bool) (*DiscordAdapter, error) {
+	return NewDiscordAdapterMulti(map[string]config.DiscordAccountConfig{
+		"default": {
+			Enabled:         true,
+			BotToken:        token,
+			AllowedChannels: allowedChannels,
+			NoMention:       noMention,
+		},
+	})
 }
 
 func (a *DiscordAdapter) Name() string { return "discord" }
@@ -54,9 +98,10 @@ func (a *DiscordAdapter) IsLocalOnly() bool    { return false }
 func (a *DiscordAdapter) AllowsCrossChat() bool { return true }
 
 func (a *DiscordAdapter) SendText(ctx context.Context, externalChatID, text string) error {
+	s := a.defaultAccount.Session
 	chunks := core.SplitText(text, 2000)
 	for _, chunk := range chunks {
-		if _, err := a.session.ChannelMessageSend(externalChatID, chunk); err != nil {
+		if _, err := s.ChannelMessageSend(externalChatID, chunk); err != nil {
 			return err
 		}
 	}
@@ -64,6 +109,7 @@ func (a *DiscordAdapter) SendText(ctx context.Context, externalChatID, text stri
 }
 
 func (a *DiscordAdapter) SendAttachment(ctx context.Context, externalChatID, filePath string, caption *string) (string, error) {
+	s := a.defaultAccount.Session
 	f, err := os.Open(filePath)
 	if err != nil {
 		return "", err
@@ -74,32 +120,48 @@ func (a *DiscordAdapter) SendAttachment(ctx context.Context, externalChatID, fil
 	if caption != nil {
 		captionText = *caption
 	}
-	_, err = a.session.ChannelFileSendWithMessage(externalChatID, captionText, filepath.Base(filePath), f)
+	_, err = s.ChannelFileSendWithMessage(externalChatID, captionText, filepath.Base(filePath), f)
 	if err != nil {
 		return "", err
 	}
 	return filePath, nil
 }
 
-// StartDiscordBot opens the Discord WebSocket and blocks until ctx is cancelled.
-func StartDiscordBot(ctx context.Context, adapter *DiscordAdapter, db *storage.Database, deps *agent.AgentDeps) error {
-	adapter.session.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
-		if m.Author == nil || m.Author.Bot {
-			return
-		}
-		go handleDiscordMessage(ctx, adapter, db, deps, s, m.Message)
-	})
+// StartDiscordBot opens the Discord WebSocket for all accounts and blocks until ctx is cancelled.
+func StartDiscordBot(ctx context.Context, adapter *DiscordAdapter, db *storage.Database, deps *agent.AgentDeps, tq *turnqueue.ChatTurnQueue) error {
+	MarkChannelStarted("discord")
 
-	if err := adapter.session.Open(); err != nil {
-		return fmt.Errorf("opening discord websocket: %w", err)
+	for _, acct := range adapter.accounts {
+		acctRef := acct
+		acctRef.Session.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
+			if m.Author == nil || m.Author.Bot {
+				return
+			}
+			go handleDiscordMessage(ctx, acctRef, db, deps, tq, s, m.Message)
+		})
+
+		if err := acctRef.Session.Open(); err != nil {
+			return fmt.Errorf("opening discord websocket for account %q: %w", acctRef.Name, err)
+		}
+		log.Printf("[discord] bot @%s (account %s) started", acctRef.Session.State.User.Username, acctRef.Name)
 	}
 
-	log.Printf("[discord] bot @%s started", adapter.session.State.User.Username)
 	<-ctx.Done()
-	return adapter.session.Close()
+
+	// Close all sessions.
+	for _, acct := range adapter.accounts {
+		acct.Session.Close()
+	}
+	return nil
 }
 
-func handleDiscordMessage(ctx context.Context, adapter *DiscordAdapter, db *storage.Database, deps *agent.AgentDeps, s *discordgo.Session, msg *discordgo.Message) {
+func handleDiscordMessage(ctx context.Context, acct *DiscordAccount, db *storage.Database, deps *agent.AgentDeps, tq *turnqueue.ChatTurnQueue, s *discordgo.Session, msg *discordgo.Message) {
+	// Startup guard: drop stale/duplicate messages.
+	msgID := FormatDiscordMsgID(msg.ID)
+	if ShouldDropRecentDuplicate("discord", msgID) {
+		return
+	}
+
 	// Determine chat type.
 	chatType := "discord_guild"
 	if msg.GuildID == "" {
@@ -124,11 +186,11 @@ func handleDiscordMessage(ctx context.Context, adapter *DiscordAdapter, db *stor
 	content := msg.Content
 
 	// Filter by allowed channels (guild only).
-	if chatType == "discord_guild" && len(adapter.allowedChannels) > 0 {
+	if chatType == "discord_guild" && len(acct.AllowedChannels) > 0 {
 		var channelID uint64
 		fmt.Sscanf(msg.ChannelID, "%d", &channelID)
 		allowed := false
-		for _, id := range adapter.allowedChannels {
+		for _, id := range acct.AllowedChannels {
 			if id == channelID {
 				allowed = true
 				break
@@ -167,13 +229,32 @@ func handleDiscordMessage(ctx context.Context, adapter *DiscordAdapter, db *stor
 					s.ChannelMessageSend(msg.ChannelID, "No active session to archive.")
 				}
 				return
+			case "/stop":
+				stopped := runcontrol.AbortRuns("discord", chatID)
+				if stopped > 0 {
+					s.ChannelMessageSend(msg.ChannelID, fmt.Sprintf("Stopping current run (%d active).", stopped))
+				} else {
+					s.ChannelMessageSend(msg.ChannelID, "No active run in this chat.")
+				}
+				return
+			case "/clear":
+				db.ClearChatContext(chatID)
+				s.ChannelMessageSend(msg.ChannelID, "Context cleared (session + chat history, scheduled tasks kept).")
+				return
+			case "/status":
+				summary, _ := db.GetLLMUsageSummary(chatID)
+				text := fmt.Sprintf("Provider: %s\nModel: %s\nRequests: %d\nTokens: %d (in: %d, out: %d)",
+					deps.LLM.ProviderName(), deps.LLM.ModelName(),
+					summary.Requests, summary.TotalTokens, summary.InputTokens, summary.OutputTokens)
+				s.ChannelMessageSend(msg.ChannelID, text)
+				return
 			}
 		}
 	}
 
 	// In guild channels, require @mention unless discord_no_mention is set.
 	botID := s.State.User.ID
-	if chatType == "discord_guild" && !adapter.noMention {
+	if chatType == "discord_guild" && !acct.NoMention {
 		mention1 := "<@" + botID + ">"
 		mention2 := "<@!" + botID + ">"
 		if !strings.Contains(content, mention1) && !strings.Contains(content, mention2) {
@@ -224,6 +305,18 @@ func handleDiscordMessage(ctx context.Context, adapter *DiscordAdapter, db *stor
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
 	})
 
+	// Turn queue: serialize agent runs per chat.
+	guard, acquired := tq.TryAcquire("discord", chatID, &turnqueue.PendingMessage{
+		SenderName: senderName,
+		Content:    content,
+		MessageID:  msgID,
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+	})
+	if !acquired {
+		return // message enqueued, will be processed after current run
+	}
+	defer guard.Release()
+
 	// Send typing indicator and keep refreshing it.
 	typingCtx, cancelTyping := context.WithCancel(ctx)
 	go func() {
@@ -249,13 +342,18 @@ func handleDiscordMessage(ctx context.Context, adapter *DiscordAdapter, db *stor
 		}
 	}
 
+	// Register run for cancellation support.
+	runID, runCtx, runCancel := runcontrol.RegisterRun(ctx, "discord", chatID, msgID)
+	defer runCancel()
+	defer runcontrol.UnregisterRun("discord", chatID, runID)
+
 	reqCtx := agent.AgentRequestContext{
 		CallerChannel: "discord",
 		ChatID:        chatID,
 		ChatType:      chatType,
 	}
 
-	response, err := agent.ProcessWithAgent(ctx, deps, reqCtx, nil, imageData)
+	response, err := agent.ProcessWithAgent(runCtx, deps, reqCtx, nil, imageData)
 	cancelTyping()
 
 	if err != nil {
