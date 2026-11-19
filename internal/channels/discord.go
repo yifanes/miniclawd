@@ -94,10 +94,13 @@ func (a *DiscordAdapter) ChatTypeRoutes() map[string]ConversationKind {
 	}
 }
 
-func (a *DiscordAdapter) IsLocalOnly() bool    { return false }
+func (a *DiscordAdapter) IsLocalOnly() bool     { return false }
 func (a *DiscordAdapter) AllowsCrossChat() bool { return true }
 
 func (a *DiscordAdapter) SendText(ctx context.Context, externalChatID, text string) error {
+	if a.defaultAccount == nil || a.defaultAccount.Session == nil {
+		return fmt.Errorf("discord: no account configured")
+	}
 	s := a.defaultAccount.Session
 	chunks := core.SplitText(text, 2000)
 	for _, chunk := range chunks {
@@ -109,6 +112,9 @@ func (a *DiscordAdapter) SendText(ctx context.Context, externalChatID, text stri
 }
 
 func (a *DiscordAdapter) SendAttachment(ctx context.Context, externalChatID, filePath string, caption *string) (string, error) {
+	if a.defaultAccount == nil || a.defaultAccount.Session == nil {
+		return "", fmt.Errorf("discord: no account configured")
+	}
 	s := a.defaultAccount.Session
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -177,15 +183,7 @@ func handleDiscordMessage(ctx context.Context, acct *DiscordAccount, db *storage
 		title = msg.Author.Username
 	}
 
-	chatID, err := db.ResolveOrCreateChatID("discord", externalID, &title, chatType)
-	if err != nil {
-		log.Printf("[discord] resolve chat error: %v", err)
-		return
-	}
-
-	content := msg.Content
-
-	// Filter by allowed channels (guild only).
+	// Filter by allowed channels (guild only) before creating any chat state.
 	if chatType == "discord_guild" && len(acct.AllowedChannels) > 0 {
 		var channelID uint64
 		fmt.Sscanf(msg.ChannelID, "%d", &channelID)
@@ -200,6 +198,14 @@ func handleDiscordMessage(ctx context.Context, acct *DiscordAccount, db *storage
 			return
 		}
 	}
+
+	chatID, err := db.ResolveOrCreateChatID("discord", externalID, &title, chatType)
+	if err != nil {
+		log.Printf("[discord] resolve chat error: %v", err)
+		return
+	}
+
+	content := msg.Content
 
 	// Handle slash commands first.
 	if strings.HasPrefix(content, "/") {
@@ -313,25 +319,9 @@ func handleDiscordMessage(ctx context.Context, acct *DiscordAccount, db *storage
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
 	})
 	if !acquired {
-		return // message enqueued, will be processed after current run
+		return // message enqueued, will be processed after the current run
 	}
 	defer guard.Release()
-
-	// Send typing indicator and keep refreshing it.
-	typingCtx, cancelTyping := context.WithCancel(ctx)
-	go func() {
-		ticker := time.NewTicker(8 * time.Second)
-		defer ticker.Stop()
-		s.ChannelTyping(msg.ChannelID)
-		for {
-			select {
-			case <-typingCtx.Done():
-				return
-			case <-ticker.C:
-				s.ChannelTyping(msg.ChannelID)
-			}
-		}
-	}()
 
 	// Download the first image attachment if present.
 	var imageData *agent.ImageData
@@ -342,60 +332,153 @@ func handleDiscordMessage(ctx context.Context, acct *DiscordAccount, db *storage
 		}
 	}
 
+	turn := &discordTurn{
+		ctx:       ctx,
+		db:        db,
+		deps:      deps,
+		session:   s,
+		chatID:    chatID,
+		chatType:  chatType,
+		channelID: msg.ChannelID,
+		msgID:     msgID,
+	}
+	turn.run(nil, imageData)
+
+	// Drain messages that arrived while this turn was running so they are not
+	// silently dropped. They are already stored in the DB, so they are passed as
+	// an override prompt instead of being re-appended from history.
+	for ctx.Err() == nil {
+		pending := tq.DrainPending("discord", chatID)
+		if len(pending) == 0 {
+			return
+		}
+		merged := joinPendingMessages(pending)
+		log.Printf("[discord] chat %d: processing %d queued message(s)", chatID, len(pending))
+		turn.run(&merged, nil)
+	}
+}
+
+// discordTurn runs one agent turn for a Discord chat.
+type discordTurn struct {
+	ctx       context.Context
+	db        *storage.Database
+	deps      *agent.AgentDeps
+	session   *discordgo.Session
+	chatID    int64
+	chatType  string
+	channelID string
+	msgID     string
+}
+
+func (t *discordTurn) run(overridePrompt *string, imageData *agent.ImageData) {
+	ctx := t.ctx
+	s := t.session
+
+	// Send typing indicator and keep refreshing it.
+	typingCtx, cancelTyping := context.WithCancel(ctx)
+	defer cancelTyping()
+	go func() {
+		ticker := time.NewTicker(8 * time.Second)
+		defer ticker.Stop()
+		s.ChannelTyping(t.channelID)
+		for {
+			select {
+			case <-typingCtx.Done():
+				return
+			case <-ticker.C:
+				s.ChannelTyping(t.channelID)
+			}
+		}
+	}()
+
 	// Register run for cancellation support.
-	runID, runCtx, runCancel := runcontrol.RegisterRun(ctx, "discord", chatID, msgID)
+	runID, runCtx, runCancel := runcontrol.RegisterRun(ctx, "discord", t.chatID, t.msgID)
 	defer runCancel()
-	defer runcontrol.UnregisterRun("discord", chatID, runID)
+	defer runcontrol.UnregisterRun("discord", t.chatID, runID)
 
 	reqCtx := agent.AgentRequestContext{
 		CallerChannel: "discord",
-		ChatID:        chatID,
-		ChatType:      chatType,
+		ChatID:        t.chatID,
+		ChatType:      t.chatType,
 	}
 
-	response, err := agent.ProcessWithAgent(runCtx, deps, reqCtx, nil, imageData)
+	response, err := agent.ProcessWithAgent(runCtx, t.deps, reqCtx, overridePrompt, imageData)
 	cancelTyping()
 
 	if err != nil {
-		log.Printf("[discord] agent error for chat %d: %v", chatID, err)
-		s.ChannelMessageSend(msg.ChannelID, core.UserFacingError(err))
+		log.Printf("[discord] agent error for chat %d: %v", t.chatID, err)
+		s.ChannelMessageSend(t.channelID, core.UserFacingError(err))
 		return
 	}
 
-	log.Printf("[discord] chat %d: response (%d chars): %s", chatID, len(response), truncate(response, 200))
+	log.Printf("[discord] chat %d: response (%d chars): %s", t.chatID, len(response), truncate(response, 200))
 
-	chunks := core.SplitText(response, 2000)
-	for _, chunk := range chunks {
-		if _, err := s.ChannelMessageSend(msg.ChannelID, chunk); err != nil {
+	for _, chunk := range core.SplitText(response, 2000) {
+		if _, err := s.ChannelMessageSend(t.channelID, chunk); err != nil {
 			log.Printf("[discord] send error: %v", err)
 		}
 	}
 
-	db.StoreMessage(storage.StoredMessage{
+	botName := "miniclawd"
+	if s.State != nil && s.State.User != nil {
+		botName = s.State.User.Username
+	}
+	t.db.StoreMessage(storage.StoredMessage{
 		ID:         fmt.Sprintf("dc_bot_%d", time.Now().UnixNano()),
-		ChatID:     chatID,
-		SenderName: s.State.User.Username,
+		ChatID:     t.chatID,
+		SenderName: botName,
 		Content:    response,
 		IsFromBot:  true,
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
+// joinPendingMessages merges queued messages into a single prompt.
+func joinPendingMessages(pending []turnqueue.PendingMessage) string {
+	if len(pending) == 1 {
+		return pending[0].Content
+	}
+	parts := make([]string, 0, len(pending))
+	for _, p := range pending {
+		parts = append(parts, fmt.Sprintf("[%s]: %s", p.SenderName, p.Content))
+	}
+	return strings.Join(parts, "\n")
+}
+
+const maxImageBytes = 20 << 20 // 20 MiB
+
+var imageHTTPClient = &http.Client{Timeout: 60 * time.Second}
+
 func downloadDiscordImage(url string) *agent.ImageData {
-	resp, err := http.Get(url)
+	resp, err := imageHTTPClient.Get(url)
 	if err != nil {
+		log.Printf("[discord] image download error: %v", err)
 		return nil
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[discord] image download failed: status %d", resp.StatusCode)
 		return nil
 	}
 
 	mediaType := "image/jpeg"
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		mediaType = ct
+		// Strip parameters such as "; charset=utf-8".
+		if idx := strings.IndexByte(ct, ';'); idx >= 0 {
+			ct = ct[:idx]
+		}
+		mediaType = strings.TrimSpace(ct)
+	}
+	if !strings.HasPrefix(mediaType, "image/") {
+		log.Printf("[discord] attachment is not an image: %s", mediaType)
+		return nil
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxImageBytes))
+	if err != nil {
+		log.Printf("[discord] image read error: %v", err)
+		return nil
 	}
 
 	return &agent.ImageData{

@@ -102,7 +102,7 @@ func (a *TelegramAdapter) ChatTypeRoutes() map[string]ConversationKind {
 }
 
 func (a *TelegramAdapter) IsLocalOnly() bool     { return false }
-func (a *TelegramAdapter) AllowsCrossChat() bool  { return true }
+func (a *TelegramAdapter) AllowsCrossChat() bool { return true }
 
 // parseTelegramExternalChatID parses "chatID" or "chatID:threadID" format.
 func parseTelegramExternalChatID(externalChatID string) (chatID int64, threadID int, hasThread bool) {
@@ -117,6 +117,9 @@ func parseTelegramExternalChatID(externalChatID string) (chatID int64, threadID 
 }
 
 func (a *TelegramAdapter) SendText(ctx context.Context, externalChatID, text string) error {
+	if a.defaultAccount == nil || a.defaultAccount.Bot == nil {
+		return fmt.Errorf("telegram: no account configured")
+	}
 	bot := a.defaultAccount.Bot
 	chatID, threadID, hasThread := parseTelegramExternalChatID(externalChatID)
 
@@ -140,6 +143,9 @@ func (a *TelegramAdapter) SendText(ctx context.Context, externalChatID, text str
 }
 
 func (a *TelegramAdapter) SendAttachment(ctx context.Context, externalChatID, filePath string, caption *string) (string, error) {
+	if a.defaultAccount == nil || a.defaultAccount.Bot == nil {
+		return "", fmt.Errorf("telegram: no account configured")
+	}
 	bot := a.defaultAccount.Bot
 	chatID, _, _ := parseTelegramExternalChatID(externalChatID)
 
@@ -376,28 +382,9 @@ func handleTelegramMessage(ctx context.Context, acct *TelegramAccount, db *stora
 		Timestamp:  time.Unix(int64(msg.Date), 0).UTC().Format(time.RFC3339),
 	})
 	if !acquired {
-		return // message enqueued, will be processed after current run
+		return // message enqueued, will be processed after the current run
 	}
 	defer guard.Release()
-
-	// Start typing indicator.
-	typingCtx, cancelTyping := context.WithCancel(ctx)
-	go func() {
-		ticker := time.NewTicker(4 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-typingCtx.Done():
-				return
-			case <-ticker.C:
-				action := tgbotapi.NewChatAction(msg.Chat.ID, tgbotapi.ChatTyping)
-				acct.Bot.Send(action)
-			}
-		}
-	}()
-	// Send initial typing.
-	action := tgbotapi.NewChatAction(msg.Chat.ID, tgbotapi.ChatTyping)
-	acct.Bot.Send(action)
 
 	// Check for photo.
 	var imageData *agent.ImageData
@@ -412,34 +399,89 @@ func handleTelegramMessage(ctx context.Context, acct *TelegramAccount, db *stora
 		}
 	}
 
-	// Register run for cancellation support.
-	runID, runCtx, runCancel := runcontrol.RegisterRun(ctx, "telegram", chatID, msgID)
-	defer runCancel()
-	defer runcontrol.UnregisterRun("telegram", chatID, runID)
+	turn := &telegramTurn{
+		ctx:            ctx,
+		acct:           acct,
+		db:             db,
+		deps:           deps,
+		chatID:         chatID,
+		chatType:       chatType,
+		telegramChatID: msg.Chat.ID,
+		msgID:          msgID,
+	}
+	turn.run(nil, imageData)
 
-	// Process with agent.
+	// Drain messages that arrived while this turn was running so they are not
+	// silently dropped. They are already stored in the DB, so they are passed as
+	// an override prompt instead of being re-appended from history.
+	for ctx.Err() == nil {
+		pending := tq.DrainPending("telegram", chatID)
+		if len(pending) == 0 {
+			return
+		}
+		merged := joinPendingMessages(pending)
+		log.Printf("[telegram] chat %d: processing %d queued message(s)", chatID, len(pending))
+		turn.run(&merged, nil)
+	}
+}
+
+// telegramTurn runs one agent turn for a Telegram chat.
+type telegramTurn struct {
+	ctx            context.Context
+	acct           *TelegramAccount
+	db             *storage.Database
+	deps           *agent.AgentDeps
+	chatID         int64
+	chatType       string
+	telegramChatID int64
+	msgID          string
+}
+
+func (t *telegramTurn) run(overridePrompt *string, imageData *agent.ImageData) {
+	ctx := t.ctx
+	acct := t.acct
+
+	// Start typing indicator.
+	typingCtx, cancelTyping := context.WithCancel(ctx)
+	defer cancelTyping()
+	go func() {
+		ticker := time.NewTicker(4 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-typingCtx.Done():
+				return
+			case <-ticker.C:
+				acct.Bot.Send(tgbotapi.NewChatAction(t.telegramChatID, tgbotapi.ChatTyping))
+			}
+		}
+	}()
+	acct.Bot.Send(tgbotapi.NewChatAction(t.telegramChatID, tgbotapi.ChatTyping))
+
+	// Register run for cancellation support.
+	runID, runCtx, runCancel := runcontrol.RegisterRun(ctx, "telegram", t.chatID, t.msgID)
+	defer runCancel()
+	defer runcontrol.UnregisterRun("telegram", t.chatID, runID)
+
 	reqCtx := agent.AgentRequestContext{
 		CallerChannel: "telegram",
-		ChatID:        chatID,
-		ChatType:      chatType,
+		ChatID:        t.chatID,
+		ChatType:      t.chatType,
 	}
 
-	response, err := agent.ProcessWithAgent(runCtx, deps, reqCtx, nil, imageData)
+	response, err := agent.ProcessWithAgent(runCtx, t.deps, reqCtx, overridePrompt, imageData)
 	cancelTyping()
 
 	if err != nil {
-		log.Printf("[telegram] agent error for chat %d: %v", chatID, err)
-		reply := tgbotapi.NewMessage(msg.Chat.ID, core.UserFacingError(err))
-		acct.Bot.Send(reply)
+		log.Printf("[telegram] agent error for chat %d: %v", t.chatID, err)
+		acct.Bot.Send(tgbotapi.NewMessage(t.telegramChatID, core.UserFacingError(err)))
 		return
 	}
 
-	log.Printf("[telegram] chat %d: response (%d chars): %s", chatID, len(response), truncate(response, 200))
+	log.Printf("[telegram] chat %d: response (%d chars): %s", t.chatID, len(response), truncate(response, 200))
 
-	// Send response.
-	chunks := core.SplitText(response, 4096)
-	for _, chunk := range chunks {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, escapeMarkdownV2(chunk))
+	for _, chunk := range core.SplitText(response, 4096) {
+		reply := tgbotapi.NewMessage(t.telegramChatID, escapeMarkdownV2(chunk))
 		reply.ParseMode = "MarkdownV2"
 		if _, err := acct.Bot.Send(reply); err != nil {
 			// Fallback to plain text.
@@ -449,10 +491,9 @@ func handleTelegramMessage(ctx context.Context, acct *TelegramAccount, db *stora
 		}
 	}
 
-	// Store bot response.
-	db.StoreMessage(storage.StoredMessage{
+	t.db.StoreMessage(storage.StoredMessage{
 		ID:         fmt.Sprintf("tg_bot_%d", time.Now().UnixNano()),
-		ChatID:     chatID,
+		ChatID:     t.chatID,
 		SenderName: acct.BotUsername,
 		Content:    response,
 		IsFromBot:  true,
@@ -473,20 +514,26 @@ func downloadTelegramPhoto(bot *tgbotapi.BotAPI, fileID string) (*agent.ImageDat
 		return nil, fmt.Errorf("无法获取图片: %v", err)
 	}
 	url := file.Link(bot.Token)
-	resp, err := http.Get(url)
+	resp, err := imageHTTPClient.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("无法下载图片: %v", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("无法下载图片: HTTP %d", resp.StatusCode)
+	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxImageBytes))
 	if err != nil {
 		return nil, fmt.Errorf("读取图片失败: %v", err)
 	}
 
 	mediaType := "image/jpeg"
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		mediaType = ct
+		if idx := strings.IndexByte(ct, ';'); idx >= 0 {
+			ct = ct[:idx]
+		}
+		mediaType = strings.TrimSpace(ct)
 	}
 
 	if !supportedImageTypes[mediaType] {
