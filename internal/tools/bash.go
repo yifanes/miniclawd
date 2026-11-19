@@ -59,6 +59,7 @@ func (t *BashTool) Execute(ctx context.Context, input json.RawMessage) ToolResul
 
 	cmd := exec.CommandContext(cmdCtx, "bash", "-c", params.Command)
 	cmd.Dir = t.workingDir
+	configureProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

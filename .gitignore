@@ -5,3 +5,4 @@ tmp
 dist
 .idea/
 CLAUDE.md
+.DS_Store

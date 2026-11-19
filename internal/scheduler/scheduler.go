@@ -42,14 +42,21 @@ func runDueTasks(ctx context.Context, db *storage.Database, deps *agent.AgentDep
 	}
 
 	for _, task := range tasks {
-		// Advance next_run BEFORE spawning goroutine to prevent duplicate execution.
-		// The scheduler polls every 60s, but LLM calls can take 60-180s, so without
-		// this the same task gets fetched and executed again on the next poll.
+		// Claim the task BEFORE spawning the goroutine to prevent duplicate
+		// execution. The scheduler polls every 60s, but LLM calls can take
+		// 60-180s, so without claiming first the same task gets fetched and
+		// executed again on the next poll.
 		if task.ScheduleType == "cron" {
 			nextRun, cronErr := tools.ComputeNextCronExported(task.ScheduleValue, deps.Config.Timezone)
-			if cronErr == nil {
-				db.UpdateTaskAfterRun(task.ID, now, nextRun)
+			if cronErr != nil {
+				log.Printf("[scheduler] invalid cron for task #%d: %v", task.ID, cronErr)
+				continue
 			}
+			db.UpdateTaskAfterRun(task.ID, now, nextRun)
+		} else {
+			// One-shot task: push next_run far into the future so it cannot be
+			// picked up again; the task is marked completed after the run.
+			db.UpdateTaskAfterRun(task.ID, now, "9999-12-31T23:59:59Z")
 		}
 		go executeTask(ctx, db, deps, registry, task)
 	}

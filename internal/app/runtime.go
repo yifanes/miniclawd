@@ -22,7 +22,8 @@ import (
 	"github.com/yifanes/miniclawd/internal/web"
 )
 
-// AppState holds all shared application state.
+// AppState documents the shared application state produced during startup.
+// It is currently informational; startup wiring happens inline in Run.
 type AppState struct {
 	Config    *config.Config
 	Registry  *channels.ChannelRegistry
@@ -134,7 +135,12 @@ func Run(cfg *config.Config, db *storage.Database) error {
 
 	// Build working directory.
 	workingDir := cfg.WorkingDir
-	os.MkdirAll(workingDir, 0o755)
+	if workingDir == "" {
+		workingDir = cfg.DataDir
+	}
+	if err := os.MkdirAll(workingDir, 0o755); err != nil {
+		return fmt.Errorf("creating working directory %s: %w", workingDir, err)
+	}
 
 	// Build ToolRegistry.
 	sender := &registrySender{registry: registry, db: db}
@@ -160,20 +166,6 @@ func Run(cfg *config.Config, db *storage.Database) error {
 		Tools:  toolRegistry,
 		Skills: skillsMgr.BuildCatalog(),
 	}
-
-	// Build AppState.
-	state := &AppState{
-		Config:    cfg,
-		Registry:  registry,
-		DB:        db,
-		Memory:    memory,
-		Skills:    skillsMgr,
-		Hooks:     hooksMgr,
-		LLM:       provider,
-		Embedding: embeddingProvider,
-		Tools:     toolRegistry,
-	}
-	_ = state
 
 	// Create turn queue for per-chat serialization.
 	tq := turnqueue.New(20)

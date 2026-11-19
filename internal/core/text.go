@@ -20,7 +20,7 @@ func FloorCharBoundary(s string, index int) int {
 // SplitText splits text into chunks of at most maxLen bytes, preferring to
 // break at newline boundaries.
 func SplitText(text string, maxLen int) []string {
-	if len(text) <= maxLen {
+	if maxLen <= 0 || len(text) <= maxLen {
 		return []string{text}
 	}
 
