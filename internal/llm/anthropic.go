@@ -27,7 +27,7 @@ type AnthropicProvider struct {
 func NewAnthropicProvider(apiKey, model string, maxTokens uint32, baseURL string) *AnthropicProvider {
 	url := resolveAnthropicURL(baseURL)
 	return &AnthropicProvider{
-		client:    &http.Client{},
+		client:    newHTTPClient(),
 		apiKey:    apiKey,
 		model:     model,
 		maxTokens: maxTokens,
@@ -144,8 +144,9 @@ func (p *AnthropicProvider) parseSSE(body io.Reader, onDelta func(string)) (*cor
 		stopReason string
 		usage      *core.Usage
 		// Track tool_use blocks being streamed incrementally.
-		toolBlocks   []streamToolBlock
-		currentIndex int = -1
+		toolBlocks = make(map[int]*streamToolBlock)
+		// blockPos maps the SSE block index to its position in blocks.
+		blockPos = make(map[int]int)
 	)
 
 	for scanner.Scan() {
@@ -165,73 +166,74 @@ func (p *AnthropicProvider) parseSSE(body io.Reader, onDelta func(string)) (*cor
 
 		switch event.Type {
 		case "content_block_start":
-			currentIndex = event.Index
+			// Always append a placeholder so that block indices stay aligned with
+			// their position in blocks, even for blocks we do not render
+			// (e.g. thinking, redacted_thinking).
+			blockPos[event.Index] = len(blocks)
 			if event.ContentBlock != nil {
 				switch event.ContentBlock.Type {
-				case "text":
-					blocks = append(blocks, core.ResponseContentBlock{Type: "text"})
 				case "tool_use":
 					blocks = append(blocks, core.ResponseContentBlock{
 						Type: "tool_use",
 						ID:   event.ContentBlock.ID,
 						Name: event.ContentBlock.Name,
 					})
-					toolBlocks = append(toolBlocks, streamToolBlock{
-						index:     currentIndex,
-						id:        event.ContentBlock.ID,
-						name:      event.ContentBlock.Name,
-						inputJSON: strings.Builder{},
-					})
+					toolBlocks[event.Index] = &streamToolBlock{
+						id:   event.ContentBlock.ID,
+						name: event.ContentBlock.Name,
+					}
+				default:
+					blocks = append(blocks, core.ResponseContentBlock{Type: event.ContentBlock.Type})
 				}
+			} else {
+				blocks = append(blocks, core.ResponseContentBlock{Type: "text"})
 			}
 
 		case "content_block_delta":
+			pos, ok := blockPos[event.Index]
+			if !ok || pos >= len(blocks) {
+				continue
+			}
 			if event.Delta != nil {
 				switch event.Delta.Type {
 				case "text_delta":
-					if currentIndex >= 0 && currentIndex < len(blocks) {
-						blocks[currentIndex].Text += event.Delta.Text
-					}
+					blocks[pos].Text += event.Delta.Text
 					if onDelta != nil {
 						onDelta(event.Delta.Text)
 					}
 				case "input_json_delta":
-					// Append to the corresponding tool block's JSON accumulator.
-					for i := range toolBlocks {
-						if toolBlocks[i].index == currentIndex {
-							toolBlocks[i].inputJSON.WriteString(event.Delta.PartialJSON)
-							break
-						}
+					if tb, ok := toolBlocks[event.Index]; ok {
+						tb.inputJSON.WriteString(event.Delta.PartialJSON)
 					}
 				}
 			}
 
 		case "content_block_stop":
-			// Finalize any tool_use block's input JSON.
-			for _, tb := range toolBlocks {
-				if tb.index == currentIndex && currentIndex < len(blocks) {
-					raw := json.RawMessage(tb.inputJSON.String())
-					if len(raw) == 0 {
-						raw = json.RawMessage("{}")
-					}
-					blocks[currentIndex].Input = raw
-					break
+			if tb, ok := toolBlocks[event.Index]; ok {
+				pos := blockPos[event.Index]
+				raw := json.RawMessage(tb.inputJSON.String())
+				if len(raw) == 0 {
+					raw = json.RawMessage("{}")
 				}
+				if pos < len(blocks) {
+					blocks[pos].Input = raw
+				}
+				delete(toolBlocks, event.Index)
 			}
 
 		case "message_delta":
-			if event.Delta != nil {
-				if event.Delta.StopReason != "" {
-					stopReason = event.Delta.StopReason
-				}
+			if event.Delta != nil && event.Delta.StopReason != "" {
+				stopReason = event.Delta.StopReason
 			}
+			// message_delta carries only output_tokens; merge instead of replacing
+			// so input_tokens from message_start is preserved.
 			if event.Usage != nil {
-				usage = event.Usage
+				usage = mergeUsage(usage, event.Usage)
 			}
 
 		case "message_start":
 			if event.Message != nil && event.Message.Usage != nil {
-				usage = event.Message.Usage
+				usage = mergeUsage(usage, event.Message.Usage)
 			}
 		}
 	}
@@ -240,15 +242,43 @@ func (p *AnthropicProvider) parseSSE(body io.Reader, onDelta func(string)) (*cor
 		return nil, fmt.Errorf("reading SSE stream: %w", err)
 	}
 
+	// Drop placeholder blocks that never received any content.
+	var final []core.ResponseContentBlock
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			if b.Text != "" {
+				final = append(final, b)
+			}
+		case "tool_use":
+			final = append(final, b)
+		}
+	}
+
 	return &core.MessagesResponse{
-		Content:    blocks,
+		Content:    final,
 		StopReason: stopReason,
 		Usage:      usage,
 	}, nil
 }
 
+// mergeUsage combines token usage from multiple SSE events, preferring the
+// largest values seen for each field.
+func mergeUsage(cur, next *core.Usage) *core.Usage {
+	if cur == nil {
+		copyUsage := *next
+		return &copyUsage
+	}
+	if next.InputTokens > cur.InputTokens {
+		cur.InputTokens = next.InputTokens
+	}
+	if next.OutputTokens > cur.OutputTokens {
+		cur.OutputTokens = next.OutputTokens
+	}
+	return cur
+}
+
 type streamToolBlock struct {
-	index     int
 	id        string
 	name      string
 	inputJSON strings.Builder

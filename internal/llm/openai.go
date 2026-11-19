@@ -25,7 +25,7 @@ type OpenAIProvider struct {
 func NewOpenAIProvider(apiKey, model string, maxTokens uint32, baseURL string) *OpenAIProvider {
 	url := resolveOpenAIURL(baseURL)
 	return &OpenAIProvider{
-		client:    &http.Client{},
+		client:    newHTTPClient(),
 		apiKey:    apiKey,
 		model:     model,
 		maxTokens: maxTokens,
